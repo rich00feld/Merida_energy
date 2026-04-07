@@ -1,0 +1,803 @@
+---
+title: "R code for testing species-energy-area relationships in Merida, Mexico."
+execute: 
+  include: false
+  message: false
+  warning: false
+format:
+  html:
+    toc: true
+    toc-location: left-body
+    toc-title: Contents
+    embed-resources: true
+    code-overflow: wrap
+    self-contained: true
+    grid:
+      sidebar-width: 200px
+      body-width: 1200px
+      margin-width: 0px
+      gutter-width: 1.5rem
+editor: visual
+---
+
+Load packages
+
+```{r}
+#| label: load packages
+#| eval: true
+
+library(pacman)
+
+p_load(brms, tidyverse, tidybayes, readr, sf, terra, lubridate,
+       viridis, bayesplot, scales, marginaleffects, glue,
+       kableExtra)
+
+```
+
+```{r}
+#| label: import and organize bird data
+#| eval: true
+
+# Import data
+
+all_birds <-
+  list.files(path = "./Data", pattern = "\\.csv$") %>%
+  map_df()
+
+# Indicate if birds identified to genus or species level
+
+all_birds <- all_birds %>%
+  mutate(Level = ifelse(grepl("\\<sp\\>", Cientifico),
+    "Genus", ifelse(grepl("\\<sp.\\>", Cientifico),
+      "Genus", "Species"
+    )
+  )) %>%
+  mutate(
+    Ingles = ifelse(Level == "Genus", NA, Ingles),
+    Español = ifelse(Level == "Genus", NA, Español)
+  ) %>%
+  mutate(Date = as.Date(as.character(Fecha), format = "%Y%m%d")) %>%
+  mutate(
+    Ingles = str_to_title(Ingles),
+    Español = str_to_title(Español)
+  )
+
+# Discover whether there are multiple spellings of english and spanish names
+
+all_birds <- all_birds %>%
+  group_by(Cientifico) %>%
+  nest() %>%
+  mutate(
+    Eng_dbl = map(data, ~ length(unique(.$Ingles))),
+    Span_dbl = map(data, ~ length(unique(.$Español))),
+    AOU_dbl = map(data, ~ length(unique(.$AOU)))
+  ) %>%
+  unnest(c(data, Eng_dbl, Span_dbl, AOU_dble)) %>%
+  mutate(
+    Misspelled_eng = ifelse(Eng_dbl > 1, "Yes", "No"),
+    Misspelled_span = ifelse(Span_dbl > 1, "Yes", "No"),
+    Misspelled_aou = ifelse(AOU_dbl > 1, "Yes", "No"),
+  )
+
+# write.csv(all_birds, "all_birds.csv",
+#          fileEncoding = "latin1", row.names = FALSE)
+
+# Re-import to check only one english and spanish name and aou per scientific name
+
+all_birds <- read_csv("all_birds.csv",
+  locale = locale(encoding = "latin1")
+) %>%
+  group_by(Cientifico) %>%
+  nest() %>%
+  mutate(
+    Eng_dbl = map(data, ~ length(unique(.$Ingles))),
+    Span_dbl = map(data, ~ length(unique(.$Español))),
+    AOU_dbl = map(data, ~ length(unique(.$AOU)))
+  ) %>%
+  unnest(c(Eng_dbl, Span_dbl, AOU_dbl))
+
+all_birds %>%
+  ungroup() %>%
+  filter(Eng_dbl > 1)
+
+all_birds %>%
+  ungroup() %>%
+  filter(Span_dbl > 1)
+
+all_birds %>%
+  ungroup() %>%
+  filter(AOU_dbl > 1)
+
+# Remove higher level identifications if a species was recorded in the same site/date
+
+all_birds_2 <- all_birds %>%
+  select(-Eng_dbl, -Span_dbl, -AOU_dbl) %>%
+  unnest(data) %>%
+  select(
+    -Fecha, -Eng_dbl, -Span_dbl, #-AOU_dbl, 
+    -Misspelled_eng, -Misspelled_span, #-Misspelled_AOU
+  ) %>%
+  rowwise() %>%
+  mutate(Genus = word(Cientifico)) %>%
+  ungroup() %>%
+  distinct(Sitio, Date, Genus, .keep_all = TRUE) %>%
+  rowwise() %>%
+  mutate(Family = ifelse(grepl("Swallow", Ingles), "Hirundinidae",
+    ifelse(Cientifico == "Hirundinidae", "Hirundinidae",
+      ifelse(grepl("Hummingbird", Ingles), "Trochilidae",
+        ifelse(Cientifico == "Trochilidae",
+          "Trochilidae", Cientifico
+        )
+      )
+    )
+  )) %>%
+  ungroup() %>%
+  distinct(Sitio, Date, Family, .keep_all = TRUE) %>%
+  select(Sitio, Date, Cientifico, Ingles, Español, AOU, Visuales, Level) %>%
+  rename(
+    Site = Sitio, Scientific_name = Cientifico, English_name = Ingles,
+    Spanish_name = Español, Count = Visuales
+  )
+```
+
+```{r}
+#| label: summarize abundance per species per site
+#| eval: true 
+
+species_types <- read_csv(".Data/species_types.csv",
+  locale = locale(encoding = "latin1")
+)
+
+bird_abundances <- all_birds_2 %>%
+  group_by(Site, Scientific_name, English_name, Spanish_name, AOU) %>%
+  summarize(Abundance = sum(Count, na.rm = T)) %>%
+  left_join(., species_types, by = "Scientific_name") %>%
+  ungroup() %>%
+  select(Site, 
+         Scientific_corrected, 
+         English_name.y, 
+         Spanish_name.y, 
+         Status, 
+         Habitat, 
+         Abundance)
+
+abundance_table <- bird_abundances %>%
+  ungroup() %>%
+  arrange(Scientific_corrected) %>%
+  pivot_wider(
+    names_from = Site,
+    values_from = Abundance,
+    values_fill = 0
+  ) %>%
+  select(
+    Scientific_corrected,
+    English_name.y,
+    Spanish_name.y,
+    Acuaparque,
+    Fracc,
+    JBR,
+    Kai_Luum,
+    Mapsa,
+    PAEP,
+    PEP,
+    Habitat,
+    Status
+  ) %>%
+  rename(
+    "Scientific name" = Scientific_corrected,
+    "English name" = English_name.y,
+    "Spanish name" = Spanish_name.y,
+    "Fraccionamiento del Parque" = Fracc,
+    "Jardín Botánico Roger Orellana" = JBR,
+    "Kai Luum" = Kai_Luum,
+    "Parque Eco Arqueológico de Xoclán" = PAEP,
+    "Parque Ecológico Del Poniente" = PEP
+  ) %>%
+  kable("html",
+    caption = glue("<span style='font-size:12pt;'>Table S1. Species abundances summed across all samples from March 2, 2016 to August 23, 2018 for each of seven green areas in Merida, Yucatan, Mexico .</span>")
+  ) %>%
+  kable_styling(
+    full_width = TRUE,
+    bootstrap_options = "none",
+    font_size = 10,
+    position = "left"
+  ) %>% 
+  #row_spec(0, 
+  #         angle = -45,
+  #         extra_css = "border-bottom: 1em solid white; padding-bottom: 1em;") %>% 
+  column_spec(4:12, width = "2cm", extra_css = "padding-right: 2em;") %>%
+  #scroll_box(width = "7in") %>%
+  save_kable("Table_S1.html")
+```
+
+```{r}
+#| label: calculate species richness
+#| eval: true 
+
+bird_richness_summary <- all_birds_2 %>%
+  left_join(., species_types, by = "Scientific_name") %>%
+  ungroup() %>%
+  select(Site, Scientific_corrected, English_name.y, Spanish_name.y, Status, Habitat) %>%
+  group_by(Habitat, Status) %>%
+  summarize(Richness = n_distinct(Scientific_corrected))
+  
+bird_richness <- all_birds_2 %>%
+  left_join(., species_types, by = "Scientific_name") %>%
+  ungroup() %>%
+  select(Site, Date, Scientific_corrected, English_name.y, Spanish_name.y, Status, Habitat, Count) %>%
+  rename(Scientific_name = Scientific_corrected, English_name = English_name.y, 
+         Spanish_name = Spanish_name.y) %>%
+  mutate(Flyover = ifelse(
+    (grepl("Swift", English_name)|grepl("Swallow", English_name)|grepl("Vulture", English_name))&
+      is.na(Count), "Flyover", "Keep")) %>%
+  filter(Flyover == "Keep", Habitat == "Terrestrial") %>%
+  group_by(Site, Date, Status) %>%
+  summarize(Richness = n_distinct(Scientific_name)) %>%
+  ungroup() %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y")) 
+
+```
+
+```{r}
+#| label: explore species richness
+#| eval: true 
+
+bird_richness %>%
+  ggplot(aes(x = Richness)) +
+  geom_histogram(fill = "orange") +
+  facet_grid(Status ~ .) +
+  theme_classic()
+
+```
+
+```{r}
+#| label: import park shape files
+#| eval: true
+
+sites <- st_read("data/Merida_parks.shp")
+
+```
+
+```{r}
+#| label: import landsat
+#| eval: true
+
+red_landsat <- rast(list.files("Landsat", pattern = "B4.TIF$", full.names = TRUE))
+
+```
+
+Add NDVI and area variables
+
+April - August, 2016 = 2015-2016 September - December, 2016 = 2016-2017 January - August, 2017 = 2016-2017 September - December, 2017 = 2017-2018 January - August, 2018 = 2017-2018
+
+20160410 APRIL 2015-2016 20160523 MAY 2015-2016 20161007 OCT 2016-2017 --\> Code to Sep/Oct 20161106 NOV 2016-2017 20161206 DEC 2016-2017 20170125 JAN 2016-2017 20170224 FEB 2016-2017 20170405 APR 2016-2017 --\> Code to Mar/Apr 20170515 MAY 2016-2017 20170912 SEP 2017-2018 --\> Code to Sep/Oct 20171226 DEC 2017-2018 20180110 JAN 2017-2018 20180219 FEB 2017-2018 20180326 MAR 2017-2018 --\> Code to Mar/Apr
+
+```{r}
+
+ndvi_data <- dir_ls(paste0(getwd(), "/Gerardo_data2024/NDVI_values"), glob = "*.csv") %>%
+  set_names(\(x) path_ext_remove(path_file(x))) %>%
+  map(read.csv) %>%
+  list_rbind(names_to = "File") %>%
+  select(-c(X, ID, cell)) %>%
+  pivot_longer(-c(File, Sitio), names_to = "Date_bad", values_to = "NDVI") %>%
+  filter(!is.na(NDVI)) %>%
+  mutate(Date = as.Date(str_remove(File, "NDVI_"), format = "%Y%m%d")) %>%
+  select(-File, -Date_bad) %>%
+  rename(Site = Sitio) %>%
+  group_by(Site, Date) %>%
+  summarize(ndvi = mean(NDVI))
+
+enviro_data <- read_csv("ndvi_area_migratorias.csv") %>%
+  select(Sitio, A_VEG) %>%
+  distinct() %>%
+  rename(Site = Sitio, Area = A_VEG) %>%
+  right_join(., ndvi_data, by = "Site")
+
+data_all <- full_join(bird_richness %>%
+                        rename(Date_bird = Date),
+                      enviro_data, by = "Site", relationship = "many-to-many") %>%
+  mutate(Date_diff = abs(Date_bird - Date)) %>%
+  group_by(Site, Date, Status) %>%
+  slice_min(Date_diff) %>%
+  mutate(Remove = ifelse(Site == "Acuaparque"&Date<"2016-07-19", "Yes", 
+                         ifelse(Site == "Fracc"&Date<"2016-07-19", "Yes", "No"))) %>%
+  mutate(Month = as.numeric(format(Date, "%m")),
+         Year = as.numeric(format(Date, "%Y"))) %>%
+  filter(Month >= 9|Month <= 5,
+         Remove == "No") 
+  
+  
+  %>%
+  mutate(Day_difference = abs(Survey_day - Map_day)) %>%
+  group_by(Site, Status, Month, Year) %>%
+  filter(Day_difference == min(Day_difference)) #%>% ## CHECK MONTHS AND YEARS
+  group_by(Site, Month, Year, NDVI, AREA, Status) %>%
+  summarize(Richness = max(Richness), NDVI = max(NDVI), AREA = max(AREA))
+  
+  
+
+#%>%
+  select(Site, Survey, Richness, NDVI, AREA, Type)%>%
+  mutate(Year = as.numeric(substring(Survey, 1, 4)), 
+         Month = as.numeric(substring(Survey, 5, 6))) %>%
+  mutate(Year_2 = ifelse(Year == 2016 & Month <= 8, "2015-2016", 
+                         ifelse(Year == 2016 & Month > 8, "2016-2017", 
+                                ifelse(Year == 2017 & Month <= 8, "2016-2017", 
+                                       "2017-2018")))) %>%
+  mutate(Month_2 = case_when(Month == 1 ~ "January",
+                             Month == 2 ~ "February",
+                             Month == 3 ~ "March",
+                             Month == 4 ~ "April",
+                             Month == 5 ~ "May",
+                             Month == 9 ~ "September",
+                             Month == 10 ~ "October",
+                             Month == 11 ~ "November",
+                             Month == 12 ~ "December")) %>%
+  bind_rows(., data_residents %>%
+              filter(Site == "JBR", Year_2 == "2016-2017", Month_2 == "October") %>%
+              mutate(Richness = 0, Type = "migrants")) ##JBR for October 2016-2017 is missing
+
+```
+
+Modeling and prediction functions
+
+```{r}
+
+# Function for model
+stan_model<-function(x){
+
+  stan_lmer(Richness.l ~ NDVI.l + AREA.l + (NDVI.l + AREA.l|Year_2/Month_2), 
+      data = x,
+      #init = 0, 
+      iter = 5000, 
+      warmup = 1000,
+      adapt_delta = 0.99)
+  
+}
+
+# Function for extracting coefficients
+
+stan_coefficients <- function(x){
+  
+  fixed_effects <- x %>%
+    gather_draws(`(Intercept)`, NDVI.l, AREA.l) %>%
+    group_by(.variable) %>%
+    median_hdi() %>%
+    rename(term = .variable, Coefficient = .value) %>%
+    mutate(group = "fixed") %>%
+    select(term, group, Coefficient, .lower, .upper, .width, .point, .interval)
+  
+  
+  random_effects <- x %>%
+    spread_draws(NDVI.l, AREA.l, b[term, group]) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(Coefficient = ifelse(term == "NDVI.l", b + NDVI.l, b + AREA.l)) %>%
+    group_by(term, group) %>%
+    median_hdi(Coefficient)
+  
+  bind_rows(fixed_effects, random_effects) %>%
+    mutate(Parameter = case_when(term == "(Intercept)" ~ "Intercept",
+                                 term == "NDVI.l" ~ "Energy",
+                                 term == "AREA.l" ~ "Area"))
+  
+}
+
+# Function to create new data for prediction
+
+stan_prediction_data <- function(x){
+  
+  ndvi_range <- x %>%
+    group_by(Month_2) %>%
+    summarize(NDVI.min = min(NDVI.l),
+              NDVI.max = max (NDVI.l)) %>%
+    group_by(Month_2) %>%
+    nest() %>%
+    mutate(NDVI.l = map(data, ~seq(round(.$NDVI.min, 2), round(.$NDVI.max, 2), 0.01))) %>%
+    unnest(NDVI.l) %>%
+    select(-data)
+  
+  predicting_data <- left_join(x %>%
+                                 select(AREA.l, Month_2, Year_2),
+                               ndvi_range, 
+                               by = "Month_2")
+  
+}
+    
+stan_predictions_na <- function(x, y){
+  
+    predictions_na <- y %>%
+      select(NDVI.l, AREA.l) %>%
+      distinct() %>%
+      add_epred_draws(x, re_formula = NA) %>%
+      group_by(NDVI.l, AREA.l) %>%
+      median_qi(.epred) %>%
+      rename(Richness = .epred, Lower = .lower, Upper = .upper) #%>%  
+     # mutate(NDVI = exp(NDVI.l), AREA = exp(AREA.l))
+      
+}
+
+
+stan_predictions_null <- function(x, y){
+  
+    predictions_null <- y %>%
+      add_epred_draws(x, re_formula = NULL) %>%
+      group_by(NDVI.l, AREA.l, Month_2, Year_2) %>%
+      median_qi(.epred) %>%
+      rename(Richness = .epred, Lower = .lower, Upper = .upper) #%>%  
+      #mutate(NDVI = exp(NDVI.l), AREA = exp(AREA.l))
+      
+}
+```
+
+Load data
+
+April - August, 2016 = 2015-2016 September - December, 2016 = 2016-2017 January - August, 2017 = 2016-2017 September - December, 2017 = 2017-2018 January - August, 2018 = 2017-2018
+
+20160410 APRIL 2015-2016 20160523 MAY 2015-2016 20161007 OCT 2016-2017 --\> Code to Sep/Oct 20161106 NOV 2016-2017 20161206 DEC 2016-2017 20170125 JAN 2016-2017 20170224 FEB 2016-2017 20170405 APR 2016-2017 --\> Code to Mar/Apr 20170515 MAY 2016-2017 20170912 SEP 2017-2018 --\> Code to Sep/Oct 20171226 DEC 2017-2018 20180110 JAN 2017-2018 20180219 FEB 2017-2018 20180326 MAR 2017-2018 --\> Code to Mar/Apr
+
+```{r}
+
+data_residents <- read_csv("ndvi_area_residentes.csv") %>%
+  mutate(Type = "residents", Survey = as.character(Semana_mapa)) %>%
+  rename(Site = Sitio, Richness = Riqueza_aves) %>%
+  select(Site, Survey, Richness, NDVI, AREA, Type) %>%
+  mutate(Year = as.numeric(substring(Survey, 1, 4)), 
+         Month = as.numeric(substring(Survey, 5, 6))) %>%
+  mutate(Year_2 = ifelse(Year == 2016 & Month <= 8, "2015-2016", 
+                         ifelse(Year == 2016 & Month > 8, "2016-2017", 
+                                ifelse(Year == 2017 & Month <= 8, "2016-2017", 
+                                       "2017-2018")))) %>%
+  mutate(Month_2 = case_when(Month == 1 ~ "January",
+                             Month == 2 ~ "February",
+                             Month == 3 ~ "March",
+                             Month == 4 ~ "April",
+                             Month == 5 ~ "May",
+                             Month == 6 ~ "June",
+                             Month == 7 ~ "July",
+                             Month == 8 ~ "August",
+                             Month == 9 ~ "September",
+                             Month == 10 ~ "October",
+                             Month == 11 ~ "November",
+                             Month == 12 ~ "December")) %>%
+  filter(!Month %in% c(6,7,8))
+         
+      
+
+data_migrants <- read_csv("ndvi_area_migratorias.csv") %>%
+  mutate(Type = "migrants", Survey = as.character(Semana_mapa)) %>%
+  rename(Site = Sitio, Richness = Riqueza_aves) %>%
+  select(Site, Survey, Richness, NDVI, AREA, Type)%>%
+  mutate(Year = as.numeric(substring(Survey, 1, 4)), 
+         Month = as.numeric(substring(Survey, 5, 6))) %>%
+  mutate(Year_2 = ifelse(Year == 2016 & Month <= 8, "2015-2016", 
+                         ifelse(Year == 2016 & Month > 8, "2016-2017", 
+                                ifelse(Year == 2017 & Month <= 8, "2016-2017", 
+                                       "2017-2018")))) %>%
+  mutate(Month_2 = case_when(Month == 1 ~ "January",
+                             Month == 2 ~ "February",
+                             Month == 3 ~ "March",
+                             Month == 4 ~ "April",
+                             Month == 5 ~ "May",
+                             Month == 9 ~ "September",
+                             Month == 10 ~ "October",
+                             Month == 11 ~ "November",
+                             Month == 12 ~ "December")) %>%
+  bind_rows(., data_residents %>%
+              filter(Site == "JBR", Year_2 == "2016-2017", Month_2 == "October") %>%
+              mutate(Richness = 0, Type = "migrants")) ##JBR for October 2016-2017 is missing
+
+data_all <- bind_rows(data_residents, data_migrants) %>%
+  mutate(Richness.l = log10(Richness + 1),
+         NDVI.l = log10(NDVI),
+         AREA.l = log10(AREA))
+
+data_reduced <- data_all %>%
+  mutate(Month_2 = case_when(Month_2 == "September" ~ "September/October",
+                             Month_2 == "October" ~ "September/October",
+                             Month_2 == "March" ~ "March/April",
+                             Month_2 == "April" ~ "March/April",
+                             .default = as.character(Month_2)))
+```
+
+Run models
+
+```{r}
+stan_results <- data_reduced %>%
+  group_by(Type) %>%
+  nest() %>%
+  mutate(Model = map(data, stan_model)) %>%
+  mutate(Model_estimates = map(Model, stan_coefficients)) %>%
+  mutate(new_data = map(data, stan_prediction_data)) %>%  
+  mutate(Predictions_na = map2(Model, new_data, stan_predictions_na),
+         Predictions_null = map2(Model, new_data, stan_predictions_null))
+
+save.image("Gerardo_analysis_Apr2023_nointeraction.RData")
+```
+
+Model diagnostics
+
+```{r}
+
+stan_diag <- stan_results %>%
+  mutate(Posterior_check = map(Model, ~pp_check(.)),
+         Trace = map(Model, ~mcmc_trace(., pars = c("(Intercept)",
+                                                    "NDVI.l",
+                                                    "AREA.l", 
+                                                    "sigma"))),
+         rhat = map(Model, ~mcmc_rhat(rhat(.))),
+         neff = map(Model, ~mcmc_neff(neff_ratio(.)))) 
+
+ggsave(ggarrange(plotlist = stan_diag$Posterior_check, ncol = 1, nrow = 2,
+          widths = c(1, 1), 
+          labels = c("Residents", "Migrants"),
+          label.x = 0.05),
+       filename = "ppcheck_plots.png",
+       device="png",
+       width=23.4,
+       height=17.4,
+       units="cm",
+       dpi=600)
+
+ggsave(ggarrange(plotlist = stan_diag$Trace, ncol = 1, nrow = 2,
+          widths = c(1, 1), 
+          labels = c("Residents", "Migrants"),
+          label.x = 0.05),
+       filename = "trace_plots.png",
+       device="png",
+       width=23.4,
+       height=17.4,
+       units="cm",
+       dpi=600)
+
+ggsave(ggarrange(plotlist = stan_diag$rhat, ncol = 1, nrow = 2,
+          widths = c(1, 1), 
+          labels = c("Residents", "Migrants"),
+          label.x = 0.05),
+       filename = "rhat_plots.png",
+       device="png",
+       width=23.4,
+       height=17.4,
+       units="cm",
+       dpi=600)
+
+ggsave(ggarrange(plotlist = stan_diag$neff, ncol = 1, nrow = 2,
+          widths = c(1, 1), 
+          labels = c("Residents", "Migrants"),
+          label.x = 0.05),
+       filename = "neff_plots.png",
+       device="png",
+       width=23.4,
+       height=17.4,
+       units="cm",
+       dpi=600)
+
+
+```
+
+Summarize and graph results
+
+```{r}
+
+stan_estimates_figure <- stan_results %>%
+  select(Type, Model_estimates) %>%
+  unnest(Model_estimates) %>% 
+  mutate(Parameter = factor(Parameter, levels = c("Intercept", "Energy", "Area"))) %>%
+  filter(Parameter != "Intercept", group == "fixed") %>%
+  ggplot(aes(x = Parameter, y = Coefficient, col = Type)) +  
+  geom_point(size = 4, position = position_dodge(0.3)) +
+  geom_errorbar(aes(ymin = .lower, ymax = .upper), size = 2, width = 0.2, 
+                position = position_dodge(0.3)) +
+  geom_hline(yintercept = 0, size = 2, linetype = 2, color = "grey") +
+  scale_y_continuous(name = "\nParameter estimate") +
+  scale_x_discrete(name="") + 
+  scale_color_viridis_d(name = "", direction = -1) +
+  theme_classic() + 
+  theme(axis.line.x = element_line(colour="black"), 
+        axis.line.y = element_line(colour="black"), 
+        text = element_text(size = 12)) +
+  coord_flip()
+
+stan_estimates_figure
+
+ggsave("Parameter_estimates.png", device="png", width=23.4, height=17.4, units="cm", dpi=300)
+
+stan_estimates_month <- stan_results %>%
+  select(Type, Model_estimates) %>%
+  unnest(Model_estimates) %>% 
+  mutate(Parameter = factor(Parameter, levels = c("Intercept", "Area", "Energy"))) %>%
+  filter(Parameter != "Intercept", group != "fixed") %>%
+  rowwise() %>%
+  mutate(Month = str_split(group, ":")[[1]][3], Year = str_split(group, ":")[[1]][4]) %>%
+  filter(!is.na(Month)) %>%
+  mutate(Month = factor(Month, levels = c("May", "March/April", "February", 
+                                           "January", "December", "November",
+                                           "September/October"))) %>%
+  filter(Year == "2016-2017") %>%
+  ggplot(aes(x = Month, y = Coefficient, color = Type)) +  
+  geom_point(size = 4, position = position_dodge(0.3)) +
+  geom_errorbar(aes(ymin = .lower, ymax = .upper), size = 2, width = 0.2, 
+                position = position_dodge(0.3)) +
+  #geom_hline(yintercept = 0, size = 2, linetype = 2, color = "grey") +
+  facet_grid(. ~ Parameter, scales = "free") + 
+  scale_y_continuous(name = "\nParameter estimate") +
+  scale_x_discrete(name="") + 
+  scale_color_viridis_d(name = "", direction = -1) +
+  theme_classic() + 
+  theme(axis.line.x = element_line(colour="black"), 
+        axis.line.y = element_line(colour="black"), 
+        text = element_text(size = 12)) +
+  coord_flip()
+
+stan_estimates_month
+
+ggsave("Parameter_estimates_monthly.png", device="png", 
+       width=23.4, height=17.4, units="cm", dpi=300)
+
+```
+
+Figure of predictions
+
+```{r}
+
+stan_predictions_na_figure <- stan_results %>%
+  ungroup() %>%
+  select(Type, Predictions_na) %>%
+  unnest(Predictions_na) %>%
+  mutate(var_ndvi = "NDVI", var_area = "Area") %>% 
+  pivot_longer(cols = c(var_ndvi, var_area), names_to = "Variable") %>%
+  mutate(Keep = case_when(#value == "Area" & NDVI.l == min(.$NDVI.l) ~ "yes",
+                          value == "Area" & NDVI.l == round(median(.$NDVI.l), 2) ~ "yes",
+                          #value == "Area" & NDVI.l == max(.$NDVI.l) ~ "yes",
+                          #value == "NDVI" & AREA.l == min(.$AREA.l) ~ "yes",
+                          value == "NDVI" & AREA.l == median(.$AREA.l) ~ "yes",
+                          #value == "NDVI" & AREA.l == max(.$AREA.l) ~ "yes",
+                          .default = "no")) %>%
+  filter(Keep == "yes") %>%
+  mutate(X_var = ifelse(value == "NDVI", NDVI.l, AREA.l)) %>%
+  #arrange(value, X_var) %>%
+  #mutate(facet_str = rep(c("Min", "Median", "Max"), length.out = nrow(.))) %>%
+  #mutate(facet_str = factor(facet_str, c("Min", "Median", "Max")),
+  #       value = ifelse(value == "NDVI", "Energy", "Area")) %>%
+  ggplot(aes(x = X_var, y = Richness)) +  
+  geom_line(size = 2) +
+  facet_grid(Type ~ value) +
+  geom_ribbon(aes(ymin = Lower, 
+                  ymax = Upper), 
+              show.legend = FALSE, 
+              color = NA,
+              alpha = 0.3) +
+  scale_y_continuous(name = "log(Species richness + 1)\n") +
+  scale_x_continuous(name="\nlog(NDVI or Area)") + 
+  theme_classic() + 
+  theme(axis.line.x = element_line(colour="black"), 
+        axis.line.y = element_line(colour="black"), 
+        text = element_text(size = 12))
+
+stan_predictions_na_figure
+
+ggsave("Predictions_average.png", device="png", 
+       width=23.4, height=17.4, units="cm", dpi=300)
+
+stan_predictions_monthly_figure <- stan_results %>%
+  ungroup() %>%
+  select(Type, Predictions_null) %>%
+  unnest(Predictions_null) %>%
+  mutate(var_ndvi = "NDVI", var_area = "Area") %>% 
+  pivot_longer(cols = c(var_ndvi, var_area), names_to = "Variable") %>%
+  group_by(Type, Month_2, Year_2) %>%
+  mutate(Median = round(median(NDVI.l), 2)) %>%
+  mutate(Median_diff = NDVI.l - Median) %>%
+  mutate(Keep = case_when(value == "Area" & round(Median_diff, 2) == 0 ~ "yes",
+                          value == "NDVI" & AREA.l == median(AREA.l) ~ "yes",
+                          .default = "no")) %>%
+  filter(Keep == "yes") %>%
+  mutate(X_var = ifelse(value == "NDVI", NDVI.l, AREA.l),
+         facet_var = ifelse(value == "NDVI", AREA.l, NDVI.l)) %>%
+  mutate(Month_2 = case_when(Month_2 == "September/October" ~ "Sep/Oct",
+                             Month_2 == "November" ~ "Nov",
+                             Month_2 == "December" ~ "Dec",
+                             Month_2 == "January" ~ "Jan",
+                             Month_2 == "February" ~ "Feb",
+                             Month_2 == "March/April" ~ "Mar/Apr",
+                             Month_2 == "May" ~ "May" )) %>%
+  mutate(Month_3 = factor(Month_2, levels = c("Sep/Oct",
+                                              "Nov",
+                                              "Dec",
+                                              "Jan", 
+                                              "Feb",
+                                              "Mar/Apr", 
+                                              "May")),
+         value = ifelse(value == "NDVI", "Energy", "Area")) %>%
+  filter(Year_2 == "2016-2017") %>%
+  ggplot(aes(x = X_var, y = Richness, color = Type)) +  
+  geom_line(size = 2) +
+  #facet_nested(Type + value ~ Month_3) +
+  #facet_nested(Month_3 ~ value + Type, scales = "free_x") +
+  facet_grid(Month_3 ~ value, scales = "free_x") +
+  scale_color_grey() +
+  geom_ribbon(aes(ymin = Lower, 
+                  ymax = Upper), 
+              show.legend = FALSE, 
+              #color = NA,
+              alpha = 0.3) +
+  scale_y_continuous(name = "log(Species richness + 1)\n") +
+  scale_x_continuous(name="\nlog(NDVI or Area)") + 
+  
+  theme_classic() + 
+  theme(axis.line.x = element_line(colour="black"), 
+        axis.line.y = element_line(colour="black"), 
+        text = element_text(size = 12))
+  
+#stan_predictions_monthly_figure
+  
+
+ggsave("Predictions_monthly.png", device="png", 
+       width=23.4, height=17.4, units="cm", dpi=300)
+
+
+```
+
+Actual area gradients across months
+
+```{r}
+parks_predictions <- stan_results %>%
+  mutate(parks = map2(Model, data, stan_predictions_null))
+
+stan_predictions_parks <- parks_predictions %>%
+  ungroup() %>%
+  select(Type, parks) %>%
+  unnest(parks) %>%
+  mutate(Month_2 = case_when(Month_2 == "September/October" ~ "Sep/Oct",
+                             Month_2 == "November" ~ "Nov",
+                             Month_2 == "December" ~ "Dec",
+                             Month_2 == "January" ~ "Jan",
+                             Month_2 == "February" ~ "Feb",
+                             Month_2 == "March/April" ~ "Mar/Apr",
+                             Month_2 == "May" ~ "May" )) %>%
+  mutate(Month_3 = factor(Month_2, levels = c("Sep/Oct",
+                                              "Nov",
+                                              "Dec",
+                                              "Jan", 
+                                              "Feb",
+                                              "Mar/Apr", 
+                                              "May"))) %>%
+  filter(Year_2 == "2016-2017") %>%
+  ggplot(aes(x = AREA.l, y = Richness)) +  
+  geom_line(size = 2) +
+  #facet_nested(Type + value ~ Month_3) +
+  facet_nested(Month_3 ~ Type, scales = "free_x") +
+  geom_ribbon(aes(ymin = Lower, 
+                  ymax = Upper), 
+              show.legend = FALSE, 
+              color = NA,
+              alpha = 0.3) +
+  scale_y_continuous(name = "log(Species richness + 1)\n") +
+  scale_x_continuous(name="\nlog(Area)") + 
+  theme_classic() + 
+  theme(axis.line.x = element_line(colour="black"), 
+        axis.line.y = element_line(colour="black"), 
+        text = element_text(size = 12))
+  
+stan_predictions_parks
+  
+
+ggsave("Parks_monthly.png", device="png", 
+       width=23.4, height=17.4, units="cm", dpi=300)
+```
+
+Priors
+
+```{r}
+Priors_used <- stan_results %>%
+  filter(Type=="residents") %>%
+  ungroup() %>%
+  mutate(Priors = map(Model, ~prior_summary(.x))) %>%
+  pluck("Priors")
+
+Covariance <- stan_results %>%
+  filter(Type=="residents") %>%
+  ungroup() %>%
+  mutate(Cov = map(Model, ~summary(.x))) %>%
+  pluck("Cov")
+
+```
